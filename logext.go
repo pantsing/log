@@ -2,9 +2,11 @@ package log
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -58,6 +60,47 @@ type Logger struct {
 	out        io.Writer    // destination for output
 	buf        bytes.Buffer // for accumulating text to write
 	levelStats [6]int64
+	file       *os.File
+	symlink    string
+	ticker     *time.Ticker
+}
+
+func NewWithRotation(fp, prefix string, flag int, d time.Duration) (*Logger, error) {
+	var err error
+	var fi os.FileInfo
+
+	fp, err = filepath.Abs(fp)
+	if err != nil {
+		return nil, err
+	}
+
+	fi, err = os.Stat(fp)
+	if err != nil && os.IsExist(err) {
+		return nil, err
+	}
+	if fi != nil && fi.IsDir() {
+		err = errors.New("output destination must be a file.")
+		return nil, err
+	}
+	os.MkdirAll(filepath.Dir(fp), 0755)
+	symlink := fp
+	realFilePath := fmt.Sprintf("%s.%s", fp, time.Now().Format("20060102_150405"))
+	out, err := os.Create(realFilePath)
+	if err != nil {
+		return nil, err
+	}
+	os.Remove(symlink)
+	os.Symlink(realFilePath, symlink)
+	l := &Logger{
+		symlink: symlink,
+		file:    out,
+		out:     out,
+		prefix:  prefix,
+		Level:   1,
+		flag:    flag,
+	}
+	go l.periodicallyRotate(d)
+	return l, nil
 }
 
 // New creates a new Logger.   The out variable sets the
@@ -166,6 +209,51 @@ func (l *Logger) formatHeader(buf *bytes.Buffer, t time.Time, file string, line 
 	}
 }
 
+func (l *Logger) Rotate() (err error) {
+	l.mu.Lock()
+	defer l.Info(time.Now(), "rotated")
+	defer l.mu.Unlock()
+	if l.symlink == "" || l.file == nil {
+		return
+	}
+	realFilePath := fmt.Sprintf("%s.%s", l.symlink, time.Now().Format("20060102_150405"))
+	var out *os.File
+	out, err = os.Create(realFilePath)
+	if err != nil {
+		return
+	}
+	os.Remove(l.symlink)
+	os.Symlink(realFilePath, l.symlink)
+	l.out = out
+	err = l.file.Close()
+	if err != nil {
+		return
+	}
+	l.file = out
+	return
+}
+
+func (l *Logger) periodicallyRotate(d time.Duration) (err error) {
+	if d < time.Second {
+		d = time.Second
+	}
+	currentTime := time.Now()
+	offset := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC).Sub(time.Date(1970, 1, 1, 0, 0, 0, 0, time.Local))
+	<-time.After(currentTime.Add(offset + d/2).Round(d).Add(-offset).Sub(currentTime))
+	err = l.Rotate()
+	if err != nil {
+		return
+	}
+	l.ticker = time.NewTicker(d)
+	for range l.ticker.C {
+		err = l.Rotate()
+		if err != nil {
+			break
+		}
+	}
+	return err
+}
+
 // Output writes the output for a logging event.  The string s contains
 // the text to print after the prefix specified by the flags of the
 // Logger.  A newline is appended if the last character of s is not
@@ -213,11 +301,15 @@ func (l *Logger) Printf(format string, v ...interface{}) {
 
 // Print calls l.Output to print to the logger.
 // Arguments are handled in the manner of fmt.Print.
-func (l *Logger) Print(v ...interface{}) { l.Output("", Linfo, 2, fmt.Sprint(v...)) }
+func (l *Logger) Print(v ...interface{}) {
+	l.Output("", Linfo, 2, fmt.Sprint(v...))
+}
 
 // Println calls l.Output to print to the logger.
 // Arguments are handled in the manner of fmt.Println.
-func (l *Logger) Println(v ...interface{}) { l.Output("", Linfo, 2, fmt.Sprintln(v...)) }
+func (l *Logger) Println(v ...interface{}) {
+	l.Output("", Linfo, 2, fmt.Sprintln(v...))
+}
 
 // -----------------------------------------
 
@@ -257,7 +349,9 @@ func (l *Logger) Warnf(format string, v ...interface{}) {
 	l.Output("", Lwarn, 2, fmt.Sprintf(format, v...))
 }
 
-func (l *Logger) Warn(v ...interface{}) { l.Output("", Lwarn, 2, fmt.Sprintln(v...)) }
+func (l *Logger) Warn(v ...interface{}) {
+	l.Output("", Lwarn, 2, fmt.Sprintln(v...))
+}
 
 // -----------------------------------------
 
@@ -265,7 +359,9 @@ func (l *Logger) Errorf(format string, v ...interface{}) {
 	l.Output("", Lerror, 2, fmt.Sprintf(format, v...))
 }
 
-func (l *Logger) Error(v ...interface{}) { l.Output("", Lerror, 2, fmt.Sprintln(v...)) }
+func (l *Logger) Error(v ...interface{}) {
+	l.Output("", Lerror, 2, fmt.Sprintln(v...))
+}
 
 // -----------------------------------------
 
@@ -328,6 +424,12 @@ func (l *Logger) Stat() (stats []int64) {
 	v := l.levelStats
 	l.mu.Unlock()
 	return v[:]
+}
+
+func (l *Logger) SetOutput(w io.Writer) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.out = w
 }
 
 // Flags returns the output flags for the logger.
@@ -458,7 +560,9 @@ func Warnf(format string, v ...interface{}) {
 	Std.Output("", Lwarn, 2, fmt.Sprintf(format, v...))
 }
 
-func Warn(v ...interface{}) { Std.Output("", Lwarn, 2, fmt.Sprintln(v...)) }
+func Warn(v ...interface{}) {
+	Std.Output("", Lwarn, 2, fmt.Sprintln(v...))
+}
 
 // -----------------------------------------
 
@@ -466,7 +570,9 @@ func Errorf(format string, v ...interface{}) {
 	Std.Output("", Lerror, 2, fmt.Sprintf(format, v...))
 }
 
-func Error(v ...interface{}) { Std.Output("", Lerror, 2, fmt.Sprintln(v...)) }
+func Error(v ...interface{}) {
+	Std.Output("", Lerror, 2, fmt.Sprintln(v...))
+}
 
 // -----------------------------------------
 
@@ -524,3 +630,19 @@ func Stack(v ...interface{}) {
 }
 
 // -----------------------------------------
+
+type LogBridge struct {
+	l *Logger
+}
+
+func NewLogBridge(l *Logger) *LogBridge {
+	return &LogBridge{l: l}
+}
+
+func (lb *LogBridge) Output(calldepth int, s string) error {
+	if lb.l == nil {
+		lb.l = Std
+	}
+	lb.l.Output("", Linfo, calldepth, s)
+	return nil
+}
